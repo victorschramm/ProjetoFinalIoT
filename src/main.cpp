@@ -1,35 +1,40 @@
 /*
-  Projeto Final IoT - ESP32 + MQTT
-  Lê um potenciômetro (ADC) e converte o valor via regra de três
-  para temperatura e umidade simuladas. Envia JSON para o tópico
-  "ProjetoFinalIot" no broker público "broker.hivemq.com".
+  Projeto Final IoT - ESP32 + MQTT + DHT11
+  Lê temperatura e umidade do sensor DHT11 e envia via MQTT
+  para o tópico "ProjetoFinalIot" no broker público "broker.hivemq.com".
+
+  Formato JSON:
+  { "id_sensor": 1, "valor": 25.5, "tipo_leitura": "temperatura", "timestamp": "..." }
 
   Antes de compilar, edite `include/credentials.h` com sua rede WiFi.
 */
 
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <DHT.h>
+#include <time.h>
 #include "credentials.h"
 
 const char* mqtt_server = "broker.hivemq.com";
 const char* mqtt_topic = "ProjetoFinalIot";
 
+// Configuração NTP
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -3 * 3600;  // Fuso horário Brasil (GMT-3)
+const int daylightOffset_sec = 0;      // Sem horário de verão
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// OBS: GPIO4 é parte do ADC2 no ESP32. ADC2 é compartilhado com o WiFi
-// e leituras analógicas em ADC2 podem ser imprecisas ou indisponíveis
-// quando o WiFi está em uso. Se você notar leituras inconsistentes,
-// prefira um pino ADC1 (por exemplo 32,33,34,35,36,39).
-const int POT_PIN = 32; // ADC2_CH0 (pino do potenciômetro)
+// Configuração do DHT11
+#define DHT_PIN 32       // GPIO 32
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+const int SENSOR_ID = 1;
 const unsigned long PUBLISH_INTERVAL = 5000; // ms
 
 unsigned long lastPublish = 0;
-
-// Mapeamento em ponto flutuante (regra de 3)
-float mapf(float x, float in_min, float in_max, float out_min, float out_max) {
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
 
 void setup_wifi() {
   delay(10);
@@ -73,9 +78,29 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  analogReadResolution(12); // 0..4095
+  dht.begin();
+  Serial.println("DHT11 inicializado no GPIO 32");
 
   setup_wifi();
+
+  // Configura NTP para obter Data/Hora
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Sincronizando horário NTP...");
+  
+  // Aguarda sincronização
+  struct tm timeinfo;
+  int retry = 0;
+  while (!getLocalTime(&timeinfo) && retry < 10) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+  Serial.println();
+  if (retry < 10) {
+    Serial.println("Horário sincronizado!");
+  } else {
+    Serial.println("Falha ao sincronizar horário NTP");
+  }
 
   client.setServer(mqtt_server, 1883);
 }
@@ -91,29 +116,46 @@ void loop() {
   if (now - lastPublish >= PUBLISH_INTERVAL) {
     lastPublish = now;
 
-    int raw = analogRead(POT_PIN); // 0 - 4095
+    // Leitura do DHT22
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
 
-    // Convertendo com regra de três (mapa linear)
-    // Potenciômetro: 0-4095 -> 0-100%
-    float potValue = mapf((float)raw, 0.0f, 4095.0f, 0.0f, 100.0f);
-    
-    // Temperatura: 0-4095 -> 15-35°C
-    float temperature = mapf((float)raw, 0.0f, 4095.0f, 15.0f, 35.0f);
-    
-    // Umidade: 0-4095 -> 20-90%
-    float humidity = mapf((float)raw, 0.0f, 4095.0f, 20.0f, 90.0f);
+    // Verifica se a leitura é válida
+    if (isnan(temperature) || isnan(humidity)) {
+      Serial.println("Erro ao ler DHT11!");
+      return;
+    }
 
-    // Monta JSON com os 3 valores
-    char payload[160];
-    snprintf(payload, sizeof(payload), 
-      "{\"Potenciometro\":%.2f,\"Temp\":%.2f,\"Umidade\":%.2f}", 
-      potValue, temperature, humidity);
+    // Obtém timestamp no formato Data/Hora
+    struct tm timeinfo;
+    char timestamp[25];
+    if (getLocalTime(&timeinfo)) {
+      strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    } else {
+      snprintf(timestamp, sizeof(timestamp), "N/A");
+    }
 
-    Serial.print("Publicando: ");
-    Serial.println(payload);
+    // Payload para temperatura (Celsius)
+    char payloadTemp[200];
+    snprintf(payloadTemp, sizeof(payloadTemp), 
+      "{\"id_sensor\":%d,\"valor\":%.2f,\"tipo_leitura\":\"temperatura\",\"unidade\":\"Celsius\",\"timestamp\":\"%s\"}", 
+      SENSOR_ID, temperature, timestamp);
+
+    // Payload para umidade (UR %)
+    char payloadHum[200];
+    snprintf(payloadHum, sizeof(payloadHum), 
+      "{\"id_sensor\":%d,\"valor\":%.2f,\"tipo_leitura\":\"umidade\",\"unidade\":\"UR %%\",\"timestamp\":\"%s\"}", 
+      SENSOR_ID, humidity, timestamp);
+
+    Serial.print("Temperatura: ");
+    Serial.println(payloadTemp);
+    Serial.print("Umidade: ");
+    Serial.println(payloadHum);
 
     if (WiFi.status() == WL_CONNECTED && client.connected()) {
-      client.publish(mqtt_topic, payload);
+      client.publish(mqtt_topic, payloadTemp);
+      delay(100); // Pequeno delay entre publicações
+      client.publish(mqtt_topic, payloadHum);
     } else {
       Serial.println("Não publicado (sem conexão MQTT/WiFi)");
     }
